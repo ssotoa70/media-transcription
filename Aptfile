@@ -1,0 +1,7 @@
+# System packages required for media transcription
+# ffmpeg: audio/video processing, audio extraction from video files
+ffmpeg
+# libsndfile1: audio format handling (flac, wav, ogg)
+libsndfile1
+# libopenblas-dev: optimized linear algebra for numpy/CTranslate2 on CPU
+libopenblas-dev

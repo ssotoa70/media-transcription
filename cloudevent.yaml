@@ -1,0 +1,22 @@
+# Test CloudEvent for media-transcription function
+# Simulates an Element event when a media file is uploaded to VAST S3 storage
+#
+# Usage:
+#   vast functions invoke -e cloudevent.yaml -u http://localhost:8080
+#
+# Note: Event ID must be UUID format (hexadecimal-compatible)
+# Note: Element events require source, subject, and elementpath fields
+
+specversion: "1.0"
+type: "vastdata.com:Element.ObjectCreated"
+source: "vastdata.com:media-trigger.16ed120c-a524-4001-9b27-ecb944f99000"
+subject: "vastdata.com:kafka-view.default-topic"
+id: "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"
+time: "2026-04-06T12:00:00Z"
+datacontenttype: "application/json"
+data:
+  s3_bucket: "media-assets"
+  s3_key: "uploads/interview.mp4"
+# VAST extension attributes
+elementpath: "media-assets/uploads/interview.mp4"
+partitionkey: "media-assets/uploads/interview.mp4"
