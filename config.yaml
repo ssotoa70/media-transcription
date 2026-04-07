@@ -35,6 +35,14 @@ envs:
   # Supported media extensions (comma-separated)
   SUPPORTED_EXTENSIONS: ".mp4,.mkv,.webm,.mov,.avi,.mxf,.ts,.wav,.mp3,.flac,.ogg,.m4a,.aac,.wma"
 
+  # Schedule Trigger Configuration
+  # Used when the function is invoked by a cron/timer trigger.
+  # The function lists objects in SCHEDULE_BUCKET/SCHEDULE_PREFIX and transcribes
+  # any supported media files found. Set SCHEDULE_BUCKET to the bucket to scan.
+  SCHEDULE_BUCKET: ""
+  # S3 prefix to scan for pending media files (default: "pending/")
+  SCHEDULE_PREFIX: "pending/"
+
   # Output Configuration
   # Override output bucket (default: same as source bucket)
   OUTPUT_BUCKET: ""

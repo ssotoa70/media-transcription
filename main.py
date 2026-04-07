@@ -35,6 +35,8 @@ max_file_size_bytes: int = 0
 output_bucket: Optional[str] = None
 output_prefix: Optional[str] = None
 media_mount_path: Optional[str] = None
+schedule_bucket: Optional[str] = None
+schedule_prefix: Optional[str] = None
 
 
 # ===========================================================================
@@ -239,7 +241,7 @@ def _resolve_media_path(ctx, s3_bucket: str, s3_key: str) -> str:
 def init(ctx):
     """One-time initialization when the function container starts."""
     global s3_client, asr_engine, supported_extensions, max_file_size_bytes
-    global output_bucket, output_prefix, media_mount_path
+    global output_bucket, output_prefix, media_mount_path, schedule_bucket, schedule_prefix
 
     ctx.logger.info("=" * 80)
     ctx.logger.info("INITIALIZING MEDIA-TRANSCRIPTION FUNCTION")
@@ -283,6 +285,10 @@ def init(ctx):
     # --- Media mount path ---
     media_mount_path = os.environ.get("MEDIA_MOUNT_PATH", "") or None
 
+    # --- Schedule trigger config ---
+    schedule_bucket = os.environ.get("SCHEDULE_BUCKET", "") or None
+    schedule_prefix = os.environ.get("SCHEDULE_PREFIX", "pending/") or "pending/"
+
     ctx.logger.info(f"Supported extensions: {sorted(supported_extensions)}")
     ctx.logger.info(f"Max file size: {max_mb} MB")
     if media_mount_path:
@@ -293,6 +299,8 @@ def init(ctx):
         ctx.logger.info(f"Output bucket: {output_bucket}")
     if output_prefix:
         ctx.logger.info(f"Output prefix: {output_prefix}")
+    if schedule_bucket:
+        ctx.logger.info(f"Schedule trigger: bucket={schedule_bucket}, prefix={schedule_prefix}")
     ctx.logger.info("=" * 80)
     ctx.logger.info("MEDIA-TRANSCRIPTION FUNCTION READY")
     ctx.logger.info("=" * 80)
@@ -300,86 +308,190 @@ def init(ctx):
 
 def handler(ctx, event):
     """
-    Process incoming CloudEvent: access media, transcribe, upload result.
+    Process incoming CloudEvent. Routes by trigger type:
 
-    Media access modes:
-      - MEDIA_MOUNT_PATH set: read directly from NFS/SMB mount (no download)
-      - MEDIA_MOUNT_PATH unset: download from S3 to ephemeral disk
+      - Element:  Single file trigger (file uploaded to S3)
+      - Schedule: Cron/timer trigger (batch-process pending files)
+      - Function: Function-to-function invocation (explicit file target)
 
     Returns:
         dict with status, transcription summary, and output location
     """
     ctx.logger.info("-" * 80)
-    ctx.logger.info(f"Event ID: {event.id} | Type: {event.type}")
+    ctx.logger.info(f"Event ID: {event.id} | Type: {event.type} | Subtype: {event.subtype or 'None'}")
 
     try:
-        # --- Extract file location from event ---
-        s3_bucket, s3_key = _get_file_location(ctx, event)
-        if not s3_bucket or not s3_key:
-            return {"status": "error", "message": "Could not determine file location from event"}
-
-        # --- Check file extension ---
-        ext = Path(s3_key).suffix.lower()
-        if ext not in supported_extensions:
-            ctx.logger.info(f"Skipping unsupported file type: {ext} ({s3_key})")
-            return {"status": "skipped", "message": f"Unsupported file type: {ext}"}
-
-        ctx.logger.info(f"Processing: s3://{s3_bucket}/{s3_key}")
-
-        # --- Resolve output location ---
-        dest_bucket, output_key = _get_output_location(s3_bucket, s3_key)
-
-        # --- Idempotency: skip if transcription already exists ---
-        if _s3_object_exists(ctx, dest_bucket, output_key):
-            ctx.logger.info(f"Transcription already exists: s3://{dest_bucket}/{output_key} - skipping")
-            return {"status": "skipped", "message": "Transcription already exists", "output_location": f"s3://{dest_bucket}/{output_key}"}
-
-        # --- Resolve media file path ---
-        mount_path = _resolve_media_path(ctx, s3_bucket, s3_key)
-
-        if mount_path:
-            # Direct filesystem access (NFS/SMB mount) -- no download needed
-            result = _transcribe_from_path(ctx, mount_path, ext)
+        if event.type == "Element":
+            return _handle_element(ctx, event)
+        elif event.type == "Schedule":
+            return _handle_schedule(ctx, event)
+        elif event.type == "Function":
+            return _handle_function(ctx, event)
         else:
-            # S3 download to temp disk
-            result = _transcribe_from_s3(ctx, s3_bucket, s3_key, ext)
-
-        ctx.logger.info(
-            f"Transcription complete: {len(result.segments)} segments, "
-            f"{result.duration:.1f}s duration, language={result.language}"
-        )
-
-        # --- Build output ---
-        output = {
-            "status": "success",
-            "source_file": f"s3://{s3_bucket}/{s3_key}",
-            "asr_engine": os.environ.get("ASR_ENGINE", "faster-whisper"),
-            "asr_model": os.environ.get("ASR_MODEL_SIZE", "base"),
-            "access_mode": "mount" if mount_path else "s3",
-            "transcription": result.to_dict(),
-        }
-
-        # --- Upload result to S3 ---
-        _upload_to_s3(ctx, dest_bucket, output_key, json.dumps(output, indent=2, ensure_ascii=False))
-
-        ctx.logger.info(f"Result uploaded: s3://{dest_bucket}/{output_key}")
-        ctx.logger.info(
-            f"Summary: {result.language} | {len(result.segments)} segments | "
-            f"{len(result.text)} chars | {result.duration:.1f}s"
-        )
-
-        return {
-            "status": "success",
-            "output_location": f"s3://{dest_bucket}/{output_key}",
-            "language": result.language,
-            "duration_seconds": round(result.duration, 2),
-            "segment_count": len(result.segments),
-            "text_preview": result.text[:200] + ("..." if len(result.text) > 200 else ""),
-        }
+            ctx.logger.warning(f"Unknown event type: {event.type}")
+            return {"status": "skipped", "message": f"Unhandled event type: {event.type}"}
 
     except Exception as e:
         ctx.logger.error(f"Error processing event: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
+
+
+# ===========================================================================
+# Trigger Handlers
+# ===========================================================================
+
+def _handle_element(ctx, event):
+    """Handle Element trigger: single file uploaded to S3."""
+    try:
+        element_event = event.as_element_event()
+        s3_bucket = element_event.bucket
+        s3_key = element_event.object_key
+        ctx.logger.info(f"Element trigger: s3://{s3_bucket}/{s3_key}")
+    except (TypeError, AttributeError) as e:
+        ctx.logger.warning(f"Failed to parse Element event: {e}, trying data payload")
+        event_data = event.get_data()
+        s3_bucket = event_data.get("s3_bucket")
+        s3_key = event_data.get("s3_key")
+
+    if not s3_bucket or not s3_key:
+        return {"status": "error", "message": "Element event missing bucket/key"}
+
+    return _process_single_file(ctx, s3_bucket, s3_key)
+
+
+def _handle_schedule(ctx, event):
+    """Handle Schedule trigger: batch-process files from a configured S3 prefix.
+
+    Schedule events carry NO file information. The function discovers work
+    by listing objects under SCHEDULE_BUCKET/SCHEDULE_PREFIX.
+    """
+    sched = event.as_schedule_event()
+    ctx.logger.info(
+        f"Schedule trigger: cron={sched.cron_schedule} "
+        f"at {sched.timer_elapsed_timestamp}"
+    )
+
+    bucket = schedule_bucket
+    prefix = schedule_prefix
+
+    # Allow schedule event data to override bucket/prefix
+    event_data = event.get_data()
+    bucket = event_data.get("bucket", bucket) or bucket
+    prefix = event_data.get("prefix", prefix) or prefix
+
+    if not bucket:
+        return {"status": "error", "message": "SCHEDULE_BUCKET not configured and no bucket in event data"}
+
+    ctx.logger.info(f"Listing files: s3://{bucket}/{prefix}")
+
+    results = []
+    continuation_token = None
+
+    while True:
+        list_kwargs = {"Bucket": bucket, "Prefix": prefix}
+        if continuation_token:
+            list_kwargs["ContinuationToken"] = continuation_token
+
+        resp = s3_client.list_objects_v2(**list_kwargs)
+
+        for obj in resp.get("Contents", []):
+            key = obj["Key"]
+            ext = Path(key).suffix.lower()
+            if ext in supported_extensions:
+                result = _process_single_file(ctx, bucket, key)
+                results.append({"key": key, "status": result.get("status")})
+
+        if not resp.get("IsTruncated"):
+            break
+        continuation_token = resp.get("NextContinuationToken")
+
+    ctx.logger.info(f"Schedule batch complete: {len(results)} files processed")
+    return {
+        "status": "success",
+        "trigger": "schedule",
+        "processed": len(results),
+        "results": results,
+    }
+
+
+def _handle_function(ctx, event):
+    """Handle Function trigger: another function invoked us with a specific file."""
+    fn = event.as_function_event()
+    ctx.logger.info(f"Function trigger from: {fn.function_trigger}")
+
+    data = event.get_data()
+    s3_bucket = data.get("bucket") or data.get("s3_bucket")
+    s3_key = data.get("key") or data.get("s3_key")
+
+    if not s3_bucket or not s3_key:
+        return {"status": "error", "message": "Function event data missing bucket/key"}
+
+    return _process_single_file(ctx, s3_bucket, s3_key)
+
+
+# ===========================================================================
+# Core Processing
+# ===========================================================================
+
+def _process_single_file(ctx, s3_bucket: str, s3_key: str) -> dict:
+    """Transcribe a single media file. Used by all trigger handlers."""
+
+    # --- Check file extension ---
+    ext = Path(s3_key).suffix.lower()
+    if ext not in supported_extensions:
+        ctx.logger.info(f"Skipping unsupported file type: {ext} ({s3_key})")
+        return {"status": "skipped", "message": f"Unsupported file type: {ext}"}
+
+    ctx.logger.info(f"Processing: s3://{s3_bucket}/{s3_key}")
+
+    # --- Resolve output location ---
+    dest_bucket, output_key = _get_output_location(s3_bucket, s3_key)
+
+    # --- Idempotency: skip if transcription already exists ---
+    if _s3_object_exists(ctx, dest_bucket, output_key):
+        ctx.logger.info(f"Transcription already exists: s3://{dest_bucket}/{output_key} - skipping")
+        return {"status": "skipped", "message": "Transcription already exists", "output_location": f"s3://{dest_bucket}/{output_key}"}
+
+    # --- Resolve media file path ---
+    mount_path = _resolve_media_path(ctx, s3_bucket, s3_key)
+
+    if mount_path:
+        result = _transcribe_from_path(ctx, mount_path, ext)
+    else:
+        result = _transcribe_from_s3(ctx, s3_bucket, s3_key, ext)
+
+    ctx.logger.info(
+        f"Transcription complete: {len(result.segments)} segments, "
+        f"{result.duration:.1f}s duration, language={result.language}"
+    )
+
+    # --- Build output ---
+    output = {
+        "status": "success",
+        "source_file": f"s3://{s3_bucket}/{s3_key}",
+        "asr_engine": os.environ.get("ASR_ENGINE", "faster-whisper"),
+        "asr_model": os.environ.get("ASR_MODEL_SIZE", "base"),
+        "access_mode": "mount" if mount_path else "s3",
+        "transcription": result.to_dict(),
+    }
+
+    # --- Upload result to S3 ---
+    _upload_to_s3(ctx, dest_bucket, output_key, json.dumps(output, indent=2, ensure_ascii=False))
+
+    ctx.logger.info(f"Result uploaded: s3://{dest_bucket}/{output_key}")
+    ctx.logger.info(
+        f"Summary: {result.language} | {len(result.segments)} segments | "
+        f"{len(result.text)} chars | {result.duration:.1f}s"
+    )
+
+    return {
+        "status": "success",
+        "output_location": f"s3://{dest_bucket}/{output_key}",
+        "language": result.language,
+        "duration_seconds": round(result.duration, 2),
+        "segment_count": len(result.segments),
+        "text_preview": result.text[:200] + ("..." if len(result.text) > 200 else ""),
+    }
 
 
 # ===========================================================================
@@ -447,28 +559,6 @@ def _get_output_location(source_bucket: str, source_key: str) -> tuple[str, str]
         dest_key = str(Path(source_key).with_suffix(".transcription.json"))
 
     return dest_bucket, dest_key
-
-
-def _get_file_location(ctx, event) -> tuple[Optional[str], Optional[str]]:
-    """Extract S3 bucket and key from a VAST CloudEvent."""
-    if event.type == "Element":
-        try:
-            element_event = event.as_element_event()
-            bucket = element_event.bucket
-            key = element_event.object_key
-            ctx.logger.info(f"Element event: s3://{bucket}/{key}")
-            return bucket, key
-        except (TypeError, AttributeError) as e:
-            ctx.logger.warning(f"Failed to parse Element event, falling back to data payload: {e}")
-
-    event_data = event.get_data()
-    bucket = event_data.get("s3_bucket")
-    key = event_data.get("s3_key")
-    if bucket and key:
-        ctx.logger.info(f"Data payload: s3://{bucket}/{key}")
-        return bucket, key
-
-    return None, None
 
 
 def _s3_object_exists(ctx, bucket: str, key: str) -> bool:
