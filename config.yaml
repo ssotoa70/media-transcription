@@ -20,8 +20,17 @@ envs:
   # Beam size for decoding (higher = more accurate but slower)
   ASR_BEAM_SIZE: "5"
 
+  # Media Access
+  # Path to NFS/SMB mount where VAST S3 data is accessible as files.
+  # When set, files are read directly from the mount (zero copy, no download).
+  # When empty, files are downloaded from S3 to container temp disk.
+  # Examples:
+  #   "/vast/media"              -> reads /vast/media/<bucket>/<key>
+  #   "/vast/media/media-assets" -> reads /vast/media/media-assets/<key>
+  MEDIA_MOUNT_PATH: ""
+
   # Processing Configuration
-  # Maximum media file size in MB
+  # Maximum media file size in MB (only applies to S3 download mode)
   MAX_FILE_SIZE_MB: "2048"
   # Supported media extensions (comma-separated)
   SUPPORTED_EXTENSIONS: ".mp4,.mkv,.webm,.mov,.avi,.mxf,.ts,.wav,.mp3,.flac,.ogg,.m4a,.aac,.wma"

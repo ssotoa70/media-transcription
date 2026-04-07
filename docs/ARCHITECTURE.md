@@ -41,6 +41,42 @@ media-transcription is a stateless serverless function that runs on VAST DataEng
         (download)    (.transcription.json)
 ```
 
+## Media Access Modes
+
+VAST exposes the same data via S3 **and** NFS/SMB protocols simultaneously. The function supports both:
+
+```
+                    ┌─────────────────────────────┐
+                    │     VAST Storage Cluster     │
+                    │                              │
+                    │   ┌───────────────────────┐  │
+                    │   │     Media Files        │  │
+                    │   └──────┬────────┬────────┘  │
+                    │          │        │           │
+                    │       S3 API   NFS/SMB        │
+                    └──────┬───┘────────┬───────────┘
+                           │            │
+              ┌────────────┴──┐  ┌──────┴──────────┐
+              │  S3 Download  │  │  Mount Path      │
+              │  (fallback)   │  │  (preferred)     │
+              │               │  │                  │
+              │  Downloads to │  │  Direct read     │
+              │  temp disk    │  │  Zero copy       │
+              │  ~GB of temp  │  │  No temp disk    │
+              └───────┬───────┘  └───────┬──────────┘
+                      │                  │
+                      └────────┬─────────┘
+                               │
+                        ┌──────┴──────┐
+                        │  Transcribe │
+                        └─────────────┘
+```
+
+| Mode | Env Var | Temp Disk | Bandwidth | Use Case |
+|------|---------|-----------|-----------|----------|
+| **Mount** | `MEDIA_MOUNT_PATH=/vast/media` | Audio: 0, Video: small WAV only | None (local read) | Production on VAST |
+| **S3** | (default) | Full media + WAV | Full file download | Testing, remote S3 |
+
 ## Handler Lifecycle
 
 ### `init(ctx)` -- Container Startup
@@ -161,6 +197,7 @@ The JSON includes the full transcript, segment-level timestamps, word-level time
 
 | Decision | Rationale |
 |----------|-----------|
+| **Mount path preferred** | VAST multi-protocol access means NFS/SMB mount avoids S3 download entirely. Zero temp disk for audio files. |
 | **Single main.py** | VAST DataEngine convention. All logic in one handler file. |
 | **faster-whisper default** | 4-8x faster than original Whisper on CPU. Open-source, MIT licensed. |
 | **S3 sidecar output** | Transcription lives next to source file. No database dependency for v1. |

@@ -42,11 +42,31 @@ These credentials are used to download media files and upload transcription resu
 | `float16` | CUDA | Standard GPU precision |
 | `int8_float16` | CUDA | Fastest on GPU |
 
+## Media Access
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MEDIA_MOUNT_PATH` | NFS/SMB mount path for direct file access | (empty -- use S3) |
+
+When `MEDIA_MOUNT_PATH` is set, the function reads media files directly from the filesystem mount instead of downloading from S3. This eliminates download time and ephemeral disk usage.
+
+**Path resolution:** The function tries two mappings and uses the first that exists:
+
+| Mount Path | S3 Location | Resolved Path |
+|-----------|-------------|---------------|
+| `/vast/media` | `s3://assets/uploads/video.mp4` | `/vast/media/assets/uploads/video.mp4` |
+| `/vast/media/assets` | `s3://assets/uploads/video.mp4` | `/vast/media/assets/uploads/video.mp4` |
+
+If neither path exists on the filesystem, the function falls back to S3 download automatically.
+
+**Audio files** (wav, mp3, etc.) are passed directly to the ASR engine -- zero temp disk.
+**Video files** still need a small temp WAV for the extracted audio track (~16kHz mono, much smaller than the source).
+
 ## Processing
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MAX_FILE_SIZE_MB` | Maximum input file size | `2048` |
+| `MAX_FILE_SIZE_MB` | Maximum input file size (S3 download mode only) | `2048` |
 | `SUPPORTED_EXTENSIONS` | Comma-separated extensions | `.mp4,.mkv,.webm,.mov,.avi,.mxf,.ts,.wav,.mp3,.flac,.ogg,.m4a,.aac,.wma` |
 | `OUTPUT_BUCKET` | Destination bucket for transcriptions | (same as source) |
 | `OUTPUT_PREFIX` | Path prefix for transcription files | (same path as source) |

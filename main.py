@@ -8,6 +8,10 @@ transcription JSON back to S3 alongside the original file.
 VAST DataEngine function contract:
   - init(ctx): One-time initialization when the container starts
   - handler(ctx, event): Called for each incoming CloudEvent
+
+Media access modes:
+  - MEDIA_MOUNT_PATH set: Read files directly from NFS/SMB mount (zero copy, preferred)
+  - MEDIA_MOUNT_PATH unset: Download files from S3 to temp disk (fallback)
 """
 
 import os
@@ -30,6 +34,7 @@ supported_extensions: set[str] = set()
 max_file_size_bytes: int = 0
 output_bucket: Optional[str] = None
 output_prefix: Optional[str] = None
+media_mount_path: Optional[str] = None
 
 
 # ===========================================================================
@@ -186,12 +191,55 @@ def extract_audio(input_path: str, output_path: str, ctx) -> None:
 
 
 # ===========================================================================
+# Media Access
+# ===========================================================================
+
+def _resolve_media_path(ctx, s3_bucket: str, s3_key: str) -> str:
+    """Resolve the local filesystem path for a media file.
+
+    When MEDIA_MOUNT_PATH is set, maps s3_bucket/s3_key to a local path
+    on the NFS/SMB mount. Otherwise returns None (caller must use S3 download).
+
+    Mount path mapping:
+      MEDIA_MOUNT_PATH=/vast/media
+      s3_bucket=media-assets, s3_key=uploads/video.mp4
+      -> /vast/media/media-assets/uploads/video.mp4
+
+    If MEDIA_MOUNT_PATH already includes the bucket (common with VAST views):
+      MEDIA_MOUNT_PATH=/vast/media/media-assets
+      s3_key=uploads/video.mp4
+      -> /vast/media/media-assets/uploads/video.mp4
+    """
+    if not media_mount_path:
+        return None
+
+    # Try with bucket in path first (standard S3 layout)
+    full_path = os.path.join(media_mount_path, s3_bucket, s3_key)
+    if os.path.isfile(full_path):
+        ctx.logger.info(f"Mount access: {full_path}")
+        return full_path
+
+    # Try without bucket (mount already points to the bucket/view)
+    direct_path = os.path.join(media_mount_path, s3_key)
+    if os.path.isfile(direct_path):
+        ctx.logger.info(f"Mount access: {direct_path}")
+        return direct_path
+
+    ctx.logger.warning(
+        f"Mount path configured but file not found at {full_path} or {direct_path}. "
+        f"Falling back to S3 download."
+    )
+    return None
+
+
+# ===========================================================================
 # VAST DataEngine Function Interface
 # ===========================================================================
 
 def init(ctx):
     """One-time initialization when the function container starts."""
-    global s3_client, asr_engine, supported_extensions, max_file_size_bytes, output_bucket, output_prefix
+    global s3_client, asr_engine, supported_extensions, max_file_size_bytes
+    global output_bucket, output_prefix, media_mount_path
 
     ctx.logger.info("=" * 80)
     ctx.logger.info("INITIALIZING MEDIA-TRANSCRIPTION FUNCTION")
@@ -232,8 +280,15 @@ def init(ctx):
     output_bucket = os.environ.get("OUTPUT_BUCKET", "") or None
     output_prefix = os.environ.get("OUTPUT_PREFIX", "") or None
 
+    # --- Media mount path ---
+    media_mount_path = os.environ.get("MEDIA_MOUNT_PATH", "") or None
+
     ctx.logger.info(f"Supported extensions: {sorted(supported_extensions)}")
     ctx.logger.info(f"Max file size: {max_mb} MB")
+    if media_mount_path:
+        ctx.logger.info(f"Media mount path: {media_mount_path} (direct filesystem access)")
+    else:
+        ctx.logger.info("Media access: S3 download (set MEDIA_MOUNT_PATH for direct access)")
     if output_bucket:
         ctx.logger.info(f"Output bucket: {output_bucket}")
     if output_prefix:
@@ -245,10 +300,11 @@ def init(ctx):
 
 def handler(ctx, event):
     """
-    Process incoming CloudEvent: download media, transcribe, upload result.
+    Process incoming CloudEvent: access media, transcribe, upload result.
 
-    Supports VAST Element events (file upload triggers) and generic events
-    with s3_bucket/s3_key in the data payload.
+    Media access modes:
+      - MEDIA_MOUNT_PATH set: read directly from NFS/SMB mount (no download)
+      - MEDIA_MOUNT_PATH unset: download from S3 to ephemeral disk
 
     Returns:
         dict with status, transcription summary, and output location
@@ -278,26 +334,20 @@ def handler(ctx, event):
             ctx.logger.info(f"Transcription already exists: s3://{dest_bucket}/{output_key} - skipping")
             return {"status": "skipped", "message": "Transcription already exists", "output_location": f"s3://{dest_bucket}/{output_key}"}
 
-        # --- Download media file ---
-        with tempfile.TemporaryDirectory() as tmpdir:
-            media_path = os.path.join(tmpdir, Path(s3_key).name)
-            _download_from_s3(ctx, s3_bucket, s3_key, media_path)
+        # --- Resolve media file path ---
+        mount_path = _resolve_media_path(ctx, s3_bucket, s3_key)
 
-            # --- Extract audio if video ---
-            if ext in VIDEO_EXTENSIONS:
-                audio_path = os.path.join(tmpdir, "audio.wav")
-                extract_audio(media_path, audio_path, ctx)
-            else:
-                audio_path = media_path
+        if mount_path:
+            # Direct filesystem access (NFS/SMB mount) -- no download needed
+            result = _transcribe_from_path(ctx, mount_path, ext)
+        else:
+            # S3 download to temp disk
+            result = _transcribe_from_s3(ctx, s3_bucket, s3_key, ext)
 
-            # --- Transcribe ---
-            language = os.environ.get("ASR_LANGUAGE", "") or None
-            ctx.logger.info("Starting transcription...")
-            result = asr_engine.transcribe(audio_path, ctx, language=language)
-            ctx.logger.info(
-                f"Transcription complete: {len(result.segments)} segments, "
-                f"{result.duration:.1f}s duration, language={result.language}"
-            )
+        ctx.logger.info(
+            f"Transcription complete: {len(result.segments)} segments, "
+            f"{result.duration:.1f}s duration, language={result.language}"
+        )
 
         # --- Build output ---
         output = {
@@ -305,6 +355,7 @@ def handler(ctx, event):
             "source_file": f"s3://{s3_bucket}/{s3_key}",
             "asr_engine": os.environ.get("ASR_ENGINE", "faster-whisper"),
             "asr_model": os.environ.get("ASR_MODEL_SIZE", "base"),
+            "access_mode": "mount" if mount_path else "s3",
             "transcription": result.to_dict(),
         }
 
@@ -329,6 +380,49 @@ def handler(ctx, event):
     except Exception as e:
         ctx.logger.error(f"Error processing event: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
+
+
+# ===========================================================================
+# Transcription Pipelines
+# ===========================================================================
+
+def _transcribe_from_path(ctx, media_path: str, ext: str) -> ASRResult:
+    """Transcribe a media file accessible via local filesystem path.
+
+    For audio: pass directly to ASR engine (zero temp disk).
+    For video: extract audio to temp file, then transcribe.
+    """
+    language = os.environ.get("ASR_LANGUAGE", "") or None
+
+    if ext in AUDIO_EXTENSIONS:
+        # Audio: read directly from mount -- no temp files needed
+        ctx.logger.info("Transcribing audio directly from mount (zero copy)")
+        return asr_engine.transcribe(media_path, ctx, language=language)
+
+    # Video: ffmpeg reads from mount, only extracted WAV needs temp space
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = os.path.join(tmpdir, "audio.wav")
+        extract_audio(media_path, audio_path, ctx)
+        ctx.logger.info("Transcribing extracted audio...")
+        return asr_engine.transcribe(audio_path, ctx, language=language)
+
+
+def _transcribe_from_s3(ctx, bucket: str, key: str, ext: str) -> ASRResult:
+    """Download media from S3 to temp disk, then transcribe."""
+    language = os.environ.get("ASR_LANGUAGE", "") or None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        media_path = os.path.join(tmpdir, Path(key).name)
+        _download_from_s3(ctx, bucket, key, media_path)
+
+        if ext in VIDEO_EXTENSIONS:
+            audio_path = os.path.join(tmpdir, "audio.wav")
+            extract_audio(media_path, audio_path, ctx)
+        else:
+            audio_path = media_path
+
+        ctx.logger.info("Starting transcription...")
+        return asr_engine.transcribe(audio_path, ctx, language=language)
 
 
 # ===========================================================================
