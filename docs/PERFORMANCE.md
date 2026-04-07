@@ -91,9 +91,26 @@ The first invocation after scale-up downloads the model (~140MB for `base`). Str
 2. **Use `tiny` model** -- Smallest download, fastest load (~3s)
 3. **Pre-bake model in image** -- Add model to the container at build time (advanced)
 
+## Media Access Performance
+
+Choosing between mount path (NFS/SMB) and S3 download significantly impacts both performance and resource usage:
+
+| Aspect | Mount Path | S3 Download |
+|--------|-----------|------------|
+| **Bandwidth** | None (local read) | Full media file + WAV |
+| **Temp Disk (2GB video)** | ~200MB (WAV only) | ~2.2GB (media + WAV) |
+| **Temp Disk (1 hour audio)** | 0 bytes (direct pass) | ~360MB |
+| **Latency** | Immediate | 30-300s (download) |
+| **Bandwidth Cost** | $0 | Egress charges (if AWS) |
+| **Network Load** | None | High (large files) |
+
+**Recommendation:** Use mount path in production on VAST clusters. With a 2GB video, mount path uses ~10x less temp disk. For audio files, mount path eliminates temp disk entirely.
+
 ## Resource Sizing
 
 ### CPU-Only (Default)
+
+#### S3 Download Mode
 
 | Resource | `tiny` | `base` | `small` | `medium` |
 |----------|--------|--------|---------|----------|
@@ -103,6 +120,20 @@ The first invocation after scale-up downloads the model (~140MB for `base`). Str
 | Memory limit | 1Gi | 2Gi | 4Gi | 8Gi |
 | Ephemeral disk | 1Gi | 2Gi | 2Gi | 4Gi |
 
+#### Mount Path Mode (Reduced Disk)
+
+With `MEDIA_MOUNT_PATH` configured, ephemeral disk requirements drop significantly:
+
+| Resource | `tiny` | `base` | `small` | `medium` |
+|----------|--------|--------|---------|----------|
+| CPU request | 0.5 | 1.0 | 2.0 | 4.0 |
+| CPU limit | 1.0 | 2.0 | 4.0 | 8.0 |
+| Memory request | 512Mi | 1Gi | 2Gi | 4Gi |
+| Memory limit | 1Gi | 2Gi | 4Gi | 8Gi |
+| Ephemeral disk | 256Mi | 512Mi | 512Mi | 1Gi |
+
+Mount mode disk is only for extracted WAV audio, not the source file.
+
 ### GPU (CUDA)
 
 | Resource | `large-v3` |
@@ -111,14 +142,43 @@ The first invocation after scale-up downloads the model (~140MB for `base`). Str
 | Memory | 8Gi |
 | Compute type | `float16` |
 
-## Optimization Checklist
+## Production Deployment Checklist
 
-- [ ] Choose the smallest model that meets accuracy needs
-- [ ] Use `int8` compute type on CPU
-- [ ] Keep `containerConcurrency=1` (scale horizontally)
-- [ ] Set appropriate `timeoutSeconds` for expected file sizes
+### Performance & Resource Optimization
+
+- [ ] Choose the smallest model that meets accuracy needs (`base` recommended)
+- [ ] Use `int8` compute type on CPU for fastest inference
+- [ ] Keep `containerConcurrency=1` (scale horizontally, not vertically)
+- [ ] Set appropriate `timeoutSeconds` for expected file sizes (600-900s for large files)
 - [ ] Use suffix filters on triggers (don't invoke for non-media files)
-- [ ] Set `maxScale` based on cluster capacity
+- [ ] Set `maxScale` based on cluster capacity (10-20 typical)
 - [ ] Consider `minScale=1` if cold start latency matters
 - [ ] Use `LOG_LEVEL=WARNING` in production to reduce log volume
-- [ ] Set `ASR_LANGUAGE` if all media is one language (skips detection)
+- [ ] Set `ASR_LANGUAGE` if all media is one language (skips detection, ~10% faster)
+
+### Mount Path Setup (Highly Recommended)
+
+- [ ] **Mount path configured** -- Set `MEDIA_MOUNT_PATH=/vast/media` (or appropriate path)
+- [ ] **Mount verified accessible** -- Test file access from function pods
+- [ ] **Disk resources reduced** -- Ephemeral disk 1/4 to 1/10 of S3 mode
+- [ ] **Bandwidth eliminated** -- Media files read locally, not downloaded
+
+### Output Configuration
+
+- [ ] **OUTPUT_BUCKET set** -- Separate bucket for transcriptions (improves organization)
+- [ ] **OUTPUT_PREFIX set** -- Organize by date/project (e.g., `2026-04/transcripts`)
+- [ ] **Bucket permissions** -- Function has `PutObject` permission on output bucket
+
+### Monitoring & Troubleshooting
+
+- [ ] **Timeout buffer** -- Set `timeoutSeconds` 20-30% higher than typical processing time
+- [ ] **Disk monitoring** -- Alert on ephemeral disk usage >80% on mount path nodes
+- [ ] **Model download** -- First cold start will download model (~140MB for `base`)
+- [ ] **Log aggregation** -- Collect function logs for error tracking
+
+### Cost Optimization (AWS/Cloud)
+
+- [ ] **Data transfer** -- Mount path eliminates egress charges for media files
+- [ ] **Storage class** -- Use cheaper storage tier for transcription outputs if not frequently accessed
+- [ ] **Scale-to-zero** -- `minScale=0` saves compute during idle periods
+- [ ] **Regional endpoints** -- Use VAST data VIP, not public S3 (if available)

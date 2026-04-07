@@ -273,6 +273,163 @@ Then re-trigger the event.
 
 ---
 
+## Mount Path Issues
+
+### Error: "Mount path configured but file not found ... Falling back to S3"
+
+**Symptom**: Handler logs warning about mount path, then falls back to S3 download.
+
+**Cause**: The configured `MEDIA_MOUNT_PATH` exists, but the media file isn't at the expected location.
+
+**Solutions**:
+
+1. **Verify mount is accessible**:
+   ```bash
+   ls -la /vast/media
+   # Should show directories/files, not "permission denied" or "no such file"
+   ```
+
+2. **Check path resolution** -- The function tries two patterns:
+   ```
+   Try 1: /vast/media/bucket-name/object-key
+   Try 2: /vast/media/object-key
+   ```
+   Verify your file matches one of these patterns:
+   ```bash
+   # For s3://media-assets/uploads/video.mp4
+   ls -la /vast/media/media-assets/uploads/video.mp4     # Pattern 1
+   ls -la /vast/media/uploads/video.mp4                  # Pattern 2
+   ```
+
+3. **Check if MEDIA_MOUNT_PATH includes bucket** -- If your mount is already scoped to a bucket:
+   ```yaml
+   MEDIA_MOUNT_PATH: "/vast/media/media-assets"  # Mount includes bucket
+   # Try: /vast/media/media-assets/uploads/video.mp4
+   ```
+
+4. **Verify element event bucket/key** -- Check that your event's `elementpath` is correct:
+   ```bash
+   # logs should show:
+   # Processing: s3://media-assets/uploads/video.mp4
+   ```
+
+5. **Verify file permissions**:
+   ```bash
+   # Check if the function container's user can read the file
+   stat /vast/media/path/to/file.mp4
+   # Should show readable permissions
+   ```
+
+**Fallback behavior**: If mount fails, the function automatically downloads from S3 (slower but works). Check S3 credentials if download also fails.
+
+---
+
+### Error: "Permission denied" on mount path
+
+**Symptom**: `PermissionError: [Errno 13] Permission denied: '/vast/media/...'`
+
+**Cause**: The function container user doesn't have read permission on the mount.
+
+**Solutions**:
+
+1. **Check file permissions**:
+   ```bash
+   ls -l /vast/media/path/to/file.mp4
+   # Should have read permission (r) for owner/group/other
+   ```
+
+2. **Check mount permissions**:
+   ```bash
+   ls -ld /vast/media
+   # Should have x (execute) permission to traverse
+   ```
+
+3. **Verify container user** -- By default, function containers run as non-root. Ensure the mount is readable by all users or the specific container UID.
+
+4. **NFS/SMB mount options** -- Check cluster mount configuration:
+   ```bash
+   # Verify mount is not read-only or with restrictive permissions
+   mount | grep vast
+   ```
+
+---
+
+### Error: "Stale NFS file handle"
+
+**Symptom**: `OSError: [Errno 116] Stale NFS file handle`
+
+**Cause**: The NFS mount became stale (server disconnect, network issue).
+
+**Solutions**:
+
+1. **Remount the filesystem** -- Cluster administrator action:
+   ```bash
+   # On nodes where functions run
+   umount /vast/media
+   mount /vast/media
+   ```
+
+2. **Enable NFS soft mounts** -- Modify mount options for better recovery:
+   ```
+   soft,timeo=30,retrans=3
+   ```
+
+3. **Check NFS server health** -- Verify VAST cluster network connectivity and NFS service status.
+
+4. **Fallback in code** -- The function catches this error and automatically falls back to S3 download. Check logs for the fallback message.
+
+---
+
+## Output Location Issues
+
+### Error: "S3 ClientError (403): Access Denied" on upload
+
+**Symptom**: Handler fails uploading transcription JSON with 403 error.
+
+**Cause**: S3 credentials lack write permission on the output bucket.
+
+**Solutions**:
+
+1. **Check OUTPUT_BUCKET permissions** -- Verify S3 credentials have `PutObject` permission:
+   ```bash
+   # Test with aws CLI
+   aws s3 cp test.json s3://output-bucket/test.json \
+     --endpoint-url http://YOUR_DATA_VIP
+   ```
+
+2. **If OUTPUT_BUCKET is unset** -- Transcription writes to the source bucket:
+   ```yaml
+   OUTPUT_BUCKET: ""  # Writes to same bucket as source file
+   ```
+   Ensure credentials have write permission on the source bucket.
+
+3. **Verify credential scope** -- If using role-based access (VAST IAM):
+   ```bash
+   # Check that the read key also has write permission
+   # Or use a separate write key for OUTPUT_BUCKET
+   ```
+
+---
+
+### Wrong output location
+
+**Symptom**: Transcription appears in unexpected bucket/path.
+
+**Cause**: `OUTPUT_BUCKET` and `OUTPUT_PREFIX` configuration.
+
+**Verify actual behavior** using this matrix:
+
+| Config | Source | Output |
+|--------|--------|--------|
+| `OUTPUT_BUCKET=""` | `s3://media/uploads/video.mp4` | `s3://media/uploads/video.transcription.json` |
+| `OUTPUT_BUCKET="results"` | `s3://media/uploads/video.mp4` | `s3://results/uploads/video.transcription.json` |
+| `OUTPUT_PREFIX="2026"` | `s3://media/uploads/video.mp4` | `s3://media/2026/video.transcription.json` |
+| Both set | `s3://media/uploads/video.mp4` | `s3://results/2026/video.transcription.json` |
+
+Check your `config.yaml` against this table. See [Configuration Reference](CONFIGURATION.md#output-location-behavior) for more details.
+
+---
+
 ## Debugging
 
 ### Enable Verbose Logging

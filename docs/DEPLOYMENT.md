@@ -30,7 +30,30 @@ docker images | grep media-transcription
 
 ## Step 2: Configure Environment
 
-Edit `config.yaml` with your VAST cluster details:
+### Option A: Mount Path (Recommended for Production)
+
+If you have an NFS/SMB mount to your VAST cluster, configure mount-based access:
+
+```yaml
+envs:
+  S3_ENDPOINT: "http://YOUR_DATA_VIP:80"
+  S3_ACCESS_KEY: "YOUR_ACCESS_KEY"
+  S3_SECRET_KEY: "YOUR_SECRET_KEY"
+  MEDIA_MOUNT_PATH: "/vast/media"  # Path to NFS/SMB mount
+  ASR_MODEL_SIZE: "base"
+  ASR_DEVICE: "cpu"
+  ASR_COMPUTE_TYPE: "int8"
+```
+
+Mount path resolution:
+- If your mount includes the bucket name: `/vast/media/bucket-name` → set `MEDIA_MOUNT_PATH=/vast/media/bucket-name`
+- If your mount is generic: `/vast/media` → set `MEDIA_MOUNT_PATH=/vast/media`
+
+The function tries both mappings and falls back to S3 if the file isn't found.
+
+### Option B: S3 Only (Testing, Remote)
+
+For testing or non-VAST deployments:
 
 ```yaml
 envs:
@@ -40,9 +63,10 @@ envs:
   ASR_MODEL_SIZE: "base"
   ASR_DEVICE: "cpu"
   ASR_COMPUTE_TYPE: "int8"
+  # Leave MEDIA_MOUNT_PATH unset - uses S3 download
 ```
 
-See [Configuration Reference](CONFIGURATION.md) for all variables.
+See [Configuration Reference](CONFIGURATION.md) for all variables and [Media Access Modes](ARCHITECTURE.md#media-access-modes) for performance comparison.
 
 ## Step 3: Test Locally
 
@@ -88,6 +112,23 @@ In the VMS UI:
 2. Set source bucket, event type `ObjectCreated`, suffix filter (e.g., `.mp4`)
 3. Link to the `media-transcription` function
 
+## Step 5b: Set Up NFS/SMB Mount (Optional, for Mount Path Access)
+
+If you configured `MEDIA_MOUNT_PATH` in Step 2, ensure the mount is available in the function's container environment:
+
+```bash
+# Example: Mount configuration in your VAST cluster's container runtime
+# Consult your VAST DataEngine documentation for your specific setup
+# The mount should be available to all function pods at the same path
+```
+
+Verify mount is accessible:
+```bash
+# In a test pod or function invocation
+ls -la /vast/media
+# Should show media files, not permission denied
+```
+
 ## Step 6: Configure Knative Scaling
 
 For ASR workloads, recommended settings:
@@ -107,7 +148,7 @@ vast functions update media-transcription \
 | `target` (concurrency) | `1` | ASR is CPU-intensive; 1 request per pod |
 | `timeoutSeconds` | `900` | 15 minutes for large files |
 
-## Step 7: Test End-to-End
+## Step 8: Test End-to-End
 
 Upload a media file to the watched bucket:
 

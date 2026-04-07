@@ -17,7 +17,7 @@ media-transcription is a VAST DataEngine function that automatically transcribes
 Media file uploaded to S3 bucket
   --> VAST DataEngine ElementCreated trigger (suffix filter)
     --> media-transcription function container
-      --> Downloads media file from S3
+      --> Resolve media path (mount or S3 download)
       --> Extracts audio from video (ffmpeg, 16kHz mono WAV)
       --> Transcribes with faster-whisper (VAD + beam search)
       --> Writes .transcription.json sidecar to S3
@@ -25,6 +25,19 @@ Media file uploaded to S3 bucket
 ```
 
 **Idempotency:** Before processing, the function checks if a `.transcription.json` file already exists for the input. If it does, the event is skipped. Safe for event redelivery.
+
+## Media Access Modes
+
+The function supports two ways to access media files, controlled by the `MEDIA_MOUNT_PATH` environment variable:
+
+| Mode | Configuration | Performance | Use Case |
+|------|---------------|-------------|----------|
+| **Mount (NFS/SMB)** | Set `MEDIA_MOUNT_PATH=/vast/media` | ~0 temp disk (audio) or small WAV (video), zero download latency | Production on VAST clusters |
+| **S3 Download** | Leave `MEDIA_MOUNT_PATH` unset | Full file temp disk, network latency | Testing, remote S3, non-VAST systems |
+
+When both are available, the function prefers the mount path. If the mount path is configured but the file isn't found, it automatically falls back to S3 download.
+
+See [Architecture](docs/ARCHITECTURE.md) for the full data flow diagram and [Configuration](docs/CONFIGURATION.md) for mount path resolution details.
 
 ## What It Extracts
 
@@ -83,6 +96,21 @@ vast functions create -n media-transcription --from-file config.yaml
 | **Video** | `.mp4`, `.mkv`, `.webm`, `.mov`, `.avi`, `.mxf`, `.ts` |
 
 Video files are automatically converted to 16kHz mono WAV via ffmpeg before transcription.
+
+## Key Configuration Variables
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `S3_ENDPOINT` | VAST S3 endpoint URL | `https://s3.amazonaws.com` |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 credentials | (empty) |
+| `MEDIA_MOUNT_PATH` | NFS/SMB mount for direct file access | (empty, use S3) |
+| `OUTPUT_BUCKET` | Destination bucket for transcriptions | (same as source) |
+| `OUTPUT_PREFIX` | Path prefix for output files | (same path as source) |
+| `ASR_MODEL_SIZE` | Whisper model: tiny/base/small/medium/large-v3 | `base` |
+| `ASR_DEVICE` | Compute device: cpu/cuda | `cpu` |
+| `MAX_FILE_SIZE_MB` | Maximum file size to process | `2048` |
+
+See [Configuration Reference](docs/CONFIGURATION.md) for complete details on all environment variables.
 
 ## Documentation
 

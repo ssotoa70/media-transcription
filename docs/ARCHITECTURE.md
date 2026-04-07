@@ -29,7 +29,8 @@ media-transcription is a stateless serverless function that runs on VAST DataEng
            |    1. Parse VastEvent       |
            |    2. Extract bucket/key    |
            |    3. Check idempotency     |
-           |    4. Download media file   |
+           |    4. Resolve media path    |
+           |       (mount or S3)         |
            |    5. Extract audio (video) |
            |    6. Transcribe            |
            |    7. Upload JSON result    |
@@ -97,15 +98,15 @@ Called once when the container starts. Performs three initialization steps:
 
 3. **Idempotency check** -- Issues `HEAD` request for `<filename>.transcription.json`. If it already exists, skips processing. Safe for event redelivery.
 
-4. **Download media** -- Issues `HEAD` for file size validation, then `download_file()` to a temporary directory. Files exceeding `MAX_FILE_SIZE_MB` are rejected.
+4. **Resolve media path** -- Checks if `MEDIA_MOUNT_PATH` is configured. If yes and file exists on the filesystem, uses mount access. Otherwise, falls back to S3 download. Validates file size (S3 mode only).
 
-5. **Extract audio** (video files only) -- Runs ffmpeg to convert video to 16kHz mono WAV. Uses `subprocess.run()` with 600s timeout.
+5. **Extract audio** (video files only) -- Runs ffmpeg to convert video to 16kHz mono WAV. Uses `subprocess.run()` with 600s timeout. For mount path access, ffmpeg reads directly from NFS/SMB. For S3 mode, uses the downloaded temp file.
 
-6. **Transcribe** -- Calls `asr_engine.transcribe()` which runs faster-whisper with VAD filtering, beam search, and word-level timestamps.
+6. **Transcribe** -- Calls `asr_engine.transcribe()` which runs faster-whisper with VAD filtering, beam search, and word-level timestamps. Audio is read from either the mount path or temp disk depending on access mode.
 
-7. **Upload result** -- Writes JSON transcription to S3 as `<original_name>.transcription.json` alongside the source file.
+7. **Upload result** -- Writes JSON transcription to S3 as `<original_name>.transcription.json`. Destination bucket and path controlled by `OUTPUT_BUCKET` and `OUTPUT_PREFIX`.
 
-8. **Cleanup** -- `tempfile.TemporaryDirectory()` context manager ensures all temp files are deleted, even on error.
+8. **Cleanup** -- `tempfile.TemporaryDirectory()` context manager ensures all temp files are deleted, even on error. For mount path access, this removes only the extracted WAV file (if video). For S3 mode, removes the entire downloaded media file and extracted audio.
 
 ## ASR Engine Abstraction
 
@@ -144,6 +145,88 @@ Each segment contains:
 | `avg_logprob` | float | Average log probability |
 | `no_speech_prob` | float | Probability of no speech |
 | `words` | list[dict] | Word-level timestamps with probability |
+
+## Transcription Pipelines
+
+The handler selects between two transcription pathways after resolving the media path:
+
+### `_transcribe_from_path()` -- Mount Path Access
+
+When `MEDIA_MOUNT_PATH` is configured and the file exists on the filesystem:
+
+```
+Mount Path (NFS/SMB)
+    |
+    +-- Audio (wav, mp3, etc.)
+    |       |
+    |       v
+    |   Transcribe directly
+    |       |
+    |       v
+    |   Result (zero temp disk)
+    |
+    +-- Video (mp4, mkv, etc.)
+            |
+            v
+        ffmpeg reads from mount
+            |
+            v
+        Extract to temp WAV
+            |
+            v
+        Transcribe temp audio
+            |
+            v
+        Result (small temp disk)
+```
+
+Benefits:
+- Audio files: Zero ephemeral disk
+- Video files: Only temp disk for extracted WAV, not entire video
+- No bandwidth consumed for media download
+- Ideal for production on VAST clusters
+
+### `_transcribe_from_s3()` -- S3 Download
+
+When `MEDIA_MOUNT_PATH` is unset or file not found on mount:
+
+```
+S3 Bucket
+    |
+    v
+Download to temp disk
+    |
+    +-- Audio file
+    |       |
+    |       v
+    |   Transcribe temp audio
+    |       |
+    |       v
+    |   Result (full media disk + config)
+    |
+    +-- Video file
+            |
+            v
+        ffmpeg reads from temp
+            |
+            v
+        Extract to temp WAV
+            |
+            v
+        Transcribe temp audio
+            |
+            v
+        Result (full media disk + WAV)
+```
+
+Benefits:
+- Works with any S3 backend (AWS, MinIO, VAST)
+- Suitable for testing and remote deployments
+- No filesystem mount configuration needed
+
+Disk usage (S3 mode):
+- Audio file: ~equal to media size
+- Video file: Media size + extracted WAV (~10-20MB per hour)
 
 ## Audio Extraction
 
