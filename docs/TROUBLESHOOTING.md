@@ -118,7 +118,7 @@ faster-whisper==1.1.0
 
 2. **Verify endpoint** -- The `S3_ENDPOINT` must point to your VAST S3 data VIP:
    ```yaml
-   S3_ENDPOINT: "http://172.200.212.1:80"  # Correct (VAST data VIP)
+   S3_ENDPOINT: "http://YOUR_DATA_VIP:80"  # Correct (VAST data VIP)
    S3_ENDPOINT: "https://s3.amazonaws.com"  # Wrong (default)
    ```
 

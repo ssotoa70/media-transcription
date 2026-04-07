@@ -98,7 +98,7 @@ Minimal configuration (S3 mode):
 
 ```yaml
 envs:
-  S3_ENDPOINT: "http://172.200.212.1:80"
+  S3_ENDPOINT: "http://YOUR_DATA_VIP:80"
   S3_ACCESS_KEY: "YOUR_ACCESS_KEY"
   S3_SECRET_KEY: "YOUR_SECRET_KEY"
   ASR_MODEL_SIZE: "base"
@@ -110,7 +110,7 @@ Complete configuration (all variables):
 ```yaml
 envs:
   # --- S3 Access ---
-  S3_ENDPOINT: "http://172.200.212.1:80"
+  S3_ENDPOINT: "http://YOUR_DATA_VIP:80"
   S3_ACCESS_KEY: "YOUR_ACCESS_KEY"
   S3_SECRET_KEY: "YOUR_SECRET_KEY"
 
@@ -161,9 +161,9 @@ For a production VAST DataEngine deployment with optimal performance and reliabi
 ```yaml
 envs:
   # --- S3 Access (VAST Data VIP) ---
-  S3_ENDPOINT: "http://172.200.212.1:80"
-  S3_ACCESS_KEY: "prod_read_key"
-  S3_SECRET_KEY: "prod_read_secret"
+  S3_ENDPOINT: "http://YOUR_DATA_VIP:80"
+  S3_ACCESS_KEY: "YOUR_ACCESS_KEY"
+  S3_SECRET_KEY: "YOUR_SECRET_KEY"
 
   # --- Media Access (Use NFS/SMB mount for zero-copy) ---
   MEDIA_MOUNT_PATH: "/vast/media"
@@ -256,3 +256,4 @@ invoke_result = invoke_function(
 - Events **never** contain credentials, only file locations
 - Credentials in `config.yaml` are encrypted at rest by VAST when deployed
 - Use separate read/write credentials in production if possible
+
