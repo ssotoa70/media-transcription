@@ -7,39 +7,62 @@ media-transcription is a stateless serverless function that runs on VAST DataEng
 ## Event Flow
 
 ```
-                    VAST S3 Bucket
-                         |
-                  [media file uploaded]
-                         |
-                         v
-              DataEngine Element Trigger
-         (ElementCreated, suffix: .mp4/.wav/...)
-                         |
-                    [CloudEvent]
-                         |
-                         v
-            media-transcription container
-           +-----------------------------+
-           |  init(ctx)                  |
-           |    - Create S3 client       |
-           |    - Load faster-whisper    |
-           |    - Parse config           |
-           +-----------------------------+
-           |  handler(ctx, event)        |
-           |    1. Parse VastEvent       |
-           |    2. Extract bucket/key    |
-           |    3. Check idempotency     |
-           |    4. Resolve media path    |
-           |       (mount or S3)         |
-           |    5. Extract audio (video) |
-           |    6. Transcribe            |
-           |    7. Upload JSON result    |
-           |    8. Cleanup temp files    |
-           +-----------------------------+
-                 |              |
-                 v              v
-           VAST S3         VAST S3
-        (download)    (.transcription.json)
+THREE TRIGGER TYPES:
+
+ELEMENT TRIGGER:
+  VAST S3 Bucket
+    |
+    +-- [File uploaded]
+        |
+        v
+        Element.ObjectCreated CloudEvent
+        |
+        v
+        _handle_element() extracts bucket/key from elementpath
+        |
+        v
+        _process_single_file(bucket, key)
+
+
+SCHEDULE TRIGGER:
+  Cron/Timer scheduler
+    |
+    v
+    Schedule.TimerElapsed CloudEvent
+    |
+    v
+    _handle_schedule() lists S3 objects under SCHEDULE_BUCKET/SCHEDULE_PREFIX
+    |
+    v
+    For each file (with pagination):
+        _process_single_file(bucket, key)
+
+
+FUNCTION TRIGGER:
+  Calling function
+    |
+    v
+    Function CloudEvent with bucket/key in data
+    |
+    v
+    _handle_function() extracts bucket/key from event data
+    |
+    v
+    _process_single_file(bucket, key)
+
+
+COMMON CORE (all three triggers):
+  _process_single_file(bucket, key)
+    |
+    +-- Check file extension
+    +-- Resolve output location
+    +-- Check idempotency (transcription.json exists?)
+    +-- Resolve media path (mount or S3)
+    +-- Transcribe (mount path or S3 download)
+    +-- Upload JSON result
+    |
+    v
+  Return result (success/skipped/error)
 ```
 
 ## Media Access Modes
@@ -82,21 +105,64 @@ VAST exposes the same data via S3 **and** NFS/SMB protocols simultaneously. The 
 
 ### `init(ctx)` -- Container Startup
 
-Called once when the container starts. Performs three initialization steps:
+Called once when the container starts. Performs initialization:
 
 1. **S3 Client** -- Creates a global `boto3` client from `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` environment variables. Reused for all subsequent requests.
 
 2. **ASR Engine** -- Instantiates the ASR backend (default: faster-whisper) and downloads/loads the model into memory. The model stays resident across invocations.
 
-3. **Configuration** -- Parses `SUPPORTED_EXTENSIONS` and `MAX_FILE_SIZE_MB` into global state.
+3. **Configuration** -- Parses:
+   - `SUPPORTED_EXTENSIONS` (supported file types)
+   - `MAX_FILE_SIZE_MB` (S3 download limit)
+   - `OUTPUT_BUCKET` / `OUTPUT_PREFIX` (result location)
+   - `MEDIA_MOUNT_PATH` (optional NFS/SMB mount)
+   - `SCHEDULE_BUCKET` / `SCHEDULE_PREFIX` (batch processing config)
 
-### `handler(ctx, event)` -- Per-Request Processing
+### `handler(ctx, event)` -- Dispatch by Trigger Type
 
-1. **Parse event** -- Receives a `VastEvent` object. For Element triggers, calls `event.as_element_event()` to extract `bucket` and `object_key` from the `elementpath` extension.
+1. **Identify trigger type** -- Checks `event.type`:
+   - `"Element"` → calls `_handle_element()`
+   - `"Schedule"` → calls `_handle_schedule()`
+   - `"Function"` → calls `_handle_function()`
 
-2. **Validate extension** -- Checks file suffix against `SUPPORTED_EXTENSIONS`. Non-media files return early with `status: skipped`.
+2. **Route to handler** -- Each handler extracts bucket/key from the event in its own way, then delegates to `_process_single_file()`.
 
-3. **Idempotency check** -- Issues `HEAD` request for `<filename>.transcription.json`. If it already exists, skips processing. Safe for event redelivery.
+## Trigger Handlers
+
+### `_handle_element(ctx, event)` -- Single File Upload
+
+Triggered when a file is uploaded to S3 with an Element.ObjectCreated trigger:
+
+1. Parses the `elementpath` extension to extract bucket and object key
+2. Calls `_process_single_file(bucket, key)`
+3. Returns result for single file
+
+### `_handle_schedule(ctx, event)` -- Batch Processing
+
+Triggered by a cron/timer schedule event. No file info in the event:
+
+1. Reads `SCHEDULE_BUCKET` and `SCHEDULE_PREFIX` from config (can be overridden in event data)
+2. Lists objects under `s3://SCHEDULE_BUCKET/SCHEDULE_PREFIX` using pagination
+3. For each file with a supported extension, calls `_process_single_file(bucket, key)`
+4. Collects results in a list and returns summary (files processed, status of each)
+
+### `_handle_function(ctx, event)` -- Function-to-Function Invocation
+
+Triggered when another function invokes this one explicitly:
+
+1. Extracts `bucket` and `key` from the event data payload
+2. Calls `_process_single_file(bucket, key)`
+3. Returns result for single file
+
+## Core Processing: `_process_single_file()`
+
+All three trigger handlers use this common pipeline:
+
+1. **Validate extension** -- Checks file suffix against `SUPPORTED_EXTENSIONS`. Non-media files return `status: skipped`.
+
+2. **Resolve output location** -- Computes the output bucket/key based on `OUTPUT_BUCKET` and `OUTPUT_PREFIX` config.
+
+3. **Idempotency check** -- Issues `HEAD` request for the output `.transcription.json`. If it exists, skips processing (safe for event redelivery).
 
 4. **Resolve media path** -- Checks if `MEDIA_MOUNT_PATH` is configured. If yes and file exists on the filesystem, uses mount access. Otherwise, falls back to S3 download. Validates file size (S3 mode only).
 
@@ -104,9 +170,9 @@ Called once when the container starts. Performs three initialization steps:
 
 6. **Transcribe** -- Calls `asr_engine.transcribe()` which runs faster-whisper with VAD filtering, beam search, and word-level timestamps. Audio is read from either the mount path or temp disk depending on access mode.
 
-7. **Upload result** -- Writes JSON transcription to S3 as `<original_name>.transcription.json`. Destination bucket and path controlled by `OUTPUT_BUCKET` and `OUTPUT_PREFIX`.
+7. **Upload result** -- Writes JSON transcription to S3 as `<output_bucket>/<output_key>`.
 
-8. **Cleanup** -- `tempfile.TemporaryDirectory()` context manager ensures all temp files are deleted, even on error. For mount path access, this removes only the extracted WAV file (if video). For S3 mode, removes the entire downloaded media file and extracted audio.
+8. **Cleanup** -- `tempfile.TemporaryDirectory()` context manager ensures all temp files are deleted, even on error.
 
 ## ASR Engine Abstraction
 
@@ -248,22 +314,37 @@ The 600-second timeout accommodates large video files.
 
 ## Event Model
 
-VAST DataEngine wraps events in `VastEvent` objects:
+VAST DataEngine wraps events in `VastEvent` objects. Each trigger type has a different structure:
 
+### Element Event
 ```python
-# Element events (file operations)
-if event.type == "Element":
-    element_event = event.as_element_event()
-    bucket = element_event.bucket          # From elementpath extension
-    key = element_event.object_key         # From elementpath extension
-
-# Fallback for generic events
-event_data = event.get_data()
-bucket = event_data.get("s3_bucket")
-key = event_data.get("s3_key")
+event.type == "Element"
+event.as_element_event()
+  -> bucket: str (from elementpath)
+  -> object_key: str (from elementpath)
 ```
+The `elementpath` extension contains the full S3 path (e.g., `media-assets/uploads/interview.mp4`).
 
-The `elementpath` extension contains the full S3 path (e.g., `media-assets/uploads/interview.mp4`), which the runtime splits into bucket and key.
+### Schedule Event
+```python
+event.type == "Schedule"
+event.as_schedule_event()
+  -> cron_schedule: str
+  -> timer_elapsed_timestamp: str
+```
+No file information. Files are discovered by listing `SCHEDULE_BUCKET/SCHEDULE_PREFIX`.
+
+### Function Event
+```python
+event.type == "Function"
+event.as_function_event()
+  -> function_trigger: str
+
+event.get_data()
+  -> bucket: str
+  -> key: str
+```
+Bucket and key are provided in the event data payload by the calling function.
 
 ## Output Format
 

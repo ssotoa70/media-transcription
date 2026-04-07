@@ -75,13 +75,28 @@ vast functions update media-transcription \
 
 For `base` model on CPU (per pod):
 
-| Media Duration | Processing Time | Throughput |
+| Media Duration | Processing Time | Throughput (Element/Function) |
 |----------------|-----------------|-----------|
 | 1 minute | ~8s | ~7 files/min |
 | 10 minutes | ~85s | ~0.7 files/min |
 | 60 minutes | ~510s | ~0.1 files/min |
 
 With 10 pods: multiply throughput by 10.
+
+### Schedule Trigger Batch Processing
+
+Schedule triggers process files **sequentially within a pod** from `SCHEDULE_BUCKET/SCHEDULE_PREFIX` with pagination:
+
+| Scenario | Throughput | Notes |
+|----------|-----------|-------|
+| 10x 1-minute files | ~1.4 files/min | 10*8s = 80s per batch |
+| 10x 10-minute files | ~0.14 files/min | 10*85s = 850s per batch |
+| 1000 files, mixed sizes | Depends on average | Pagination handles large directories |
+
+To improve batch throughput:
+- **Horizontal scaling**: Set `maxScale=20` to run multiple batch jobs in parallel
+- **Separate buckets**: Use different `SCHEDULE_BUCKET` values for different job types
+- **Sharded prefixes**: Use `SCHEDULE_PREFIX=pending/batch-1/` and `pending/batch-2/` with separate cron schedules
 
 ### Cold Start Mitigation
 

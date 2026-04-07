@@ -48,23 +48,55 @@ faster-whisper==1.1.0
 
 **Symptom**: Handler returns `status: error` with this message.
 
-**Cause**: The CloudEvent doesn't contain a valid file location. Either the `elementpath` extension is missing (Element events) or the data payload lacks `s3_bucket`/`s3_key`.
+**Cause**: The CloudEvent doesn't contain a valid file location. The extraction depends on trigger type.
 
-**Solutions**:
+**Solutions by Trigger Type**:
 
+#### Element Trigger
 1. **Verify event format** -- Check your `cloudevent.yaml`:
    ```yaml
-   # Element events MUST have these fields:
    type: "vastdata.com:Element.ObjectCreated"
    source: "vastdata.com:trigger1.UUID-HERE"
    subject: "vastdata.com:kafka-view.default-topic"
    elementpath: "bucket-name/path/to/file.mp4"
    ```
 
-2. **Verify event ID is UUID** -- Non-hex IDs cause parsing errors:
+2. **Verify event ID is UUID**:
    ```yaml
    id: "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d"  # Correct
-   id: "test-event-001"                              # Wrong
+   id: "test-event-001"                         # Wrong
+   ```
+
+#### Schedule Trigger
+1. **Verify `SCHEDULE_BUCKET` is set** in config:
+   ```yaml
+   envs:
+     SCHEDULE_BUCKET: "media-ingest"  # Required
+     SCHEDULE_PREFIX: "pending/"
+   ```
+
+2. **Check event format** -- Should be Schedule type:
+   ```yaml
+   type: "vastdata.com:Schedule.TimerElapsed"
+   source: "vastdata.com:transcribe-cron.UUID-HERE"
+   cronschedule: "0 */6 * * *"
+   ```
+
+#### Function Trigger
+1. **Verify event data contains bucket and key**:
+   ```json
+   {
+     "data": {
+       "bucket": "media-assets",
+       "key": "uploads/interview.mp4"
+     }
+   }
+   ```
+
+2. **Check event format** -- Should be Function type:
+   ```yaml
+   type: "vastdata.com:Function"
+   source: "vastdata.com:orchestrator-function"
    ```
 
 3. **Use `--generate-event` for quick tests**:
@@ -270,6 +302,131 @@ Then re-trigger the event.
    - Add buffer for download and audio extraction
 
 3. **Use a faster model** (`tiny`) for very large files.
+
+---
+
+## Schedule Trigger Issues
+
+### Error: "SCHEDULE_BUCKET not configured"
+
+**Symptom**: Handler returns `status: error` with this message.
+
+**Cause**: Schedule trigger is configured but `SCHEDULE_BUCKET` environment variable is missing.
+
+**Solution**: Set both variables in `config.yaml`:
+
+```yaml
+envs:
+  SCHEDULE_BUCKET: "media-ingest"
+  SCHEDULE_PREFIX: "pending/"
+```
+
+Then redeploy:
+
+```bash
+vast functions update media-transcription --from-file config.yaml
+```
+
+---
+
+### Problem: Schedule batch processes no files
+
+**Symptom**: Schedule trigger fires successfully but returns `"processed": 0`.
+
+**Causes & Solutions**:
+
+1. **No files at the prefix** -- Check if objects exist:
+   ```bash
+   aws s3 ls s3://media-ingest/pending/ --endpoint-url http://YOUR_VIP
+   ```
+   If empty, upload test files to trigger processing.
+
+2. **Files don't have supported extensions** -- Schedule only processes files with extensions in `SUPPORTED_EXTENSIONS`. Check the prefix contents:
+   ```bash
+   aws s3 ls s3://media-ingest/pending/ --recursive --endpoint-url http://YOUR_VIP
+   ```
+   If files end in `.txt` or other non-media types, they are skipped.
+
+3. **Prefix path incorrect** -- Verify `SCHEDULE_PREFIX` matches your S3 layout:
+   ```bash
+   # If SCHEDULE_PREFIX="pending/"
+   # Function looks for: s3://media-ingest/pending/*
+   aws s3 ls s3://media-ingest/pending/ --recursive
+   ```
+
+4. **Permissions issue** -- Function may lack ListBucket permission. Verify S3 credentials have `ListBucket` and `GetObject` on `SCHEDULE_BUCKET`.
+
+---
+
+### Problem: Schedule batch is very slow
+
+**Symptom**: Schedule trigger takes much longer than expected to process all files.
+
+**Cause**: Files are processed **sequentially within a pod**. Large batches take proportional time.
+
+**Solutions**:
+
+1. **Use more pods** -- Set `maxScale` higher:
+   ```bash
+   vast functions update media-transcription \
+     --custom-extension autoscaling.knative.dev/maxScale=20
+   ```
+   With multiple pods, multiple batches can run in parallel.
+
+2. **Shard by prefix** -- Instead of one large prefix, create multiple smaller ones:
+   ```bash
+   # Batch 1: s3://media-ingest/pending-batch-1/
+   # Batch 2: s3://media-ingest/pending-batch-2/
+   # Two separate cron triggers with different SCHEDULE_PREFIX
+   ```
+
+3. **Use Element triggers instead** -- For immediate processing without waiting for cron, configure Element triggers on file upload. Schedule is better for periodic cleanup/reprocessing.
+
+---
+
+## Function Trigger Issues
+
+### Error: "Function event data missing bucket/key"
+
+**Symptom**: Handler returns `status: error` with this message.
+
+**Cause**: The calling function didn't include bucket and key in the CloudEvent data.
+
+**Solution**: Ensure the calling function passes the correct data structure:
+
+```python
+# Correct: includes bucket and key
+invoke_result = invoke_function(
+    "media-transcription",
+    {
+        "bucket": "media-assets",
+        "key": "uploads/interview.mp4"
+    }
+)
+
+# Wrong: missing data
+invoke_function("media-transcription")
+
+# Wrong: incorrect field names
+invoke_function("media-transcription", {"s3_bucket": "..."})
+```
+
+---
+
+### Problem: Function trigger results are not visible
+
+**Symptom**: Function trigger completes but output is not in the expected location.
+
+**Solutions**:
+
+1. **Check function logs** for the actual output location:
+   ```bash
+   vastde logs get YOUR_PIPELINE --since 5m | grep "Result uploaded"
+   ```
+
+2. **Verify OUTPUT_BUCKET and OUTPUT_PREFIX** -- The output location depends on these env vars. See [Troubleshooting: Wrong output location](TROUBLESHOOTING.md#wrong-output-location).
+
+3. **Check S3 permissions** -- Verify credentials have `PutObject` on OUTPUT_BUCKET or source bucket.
 
 ---
 

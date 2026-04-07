@@ -72,6 +72,15 @@ If neither path exists on the filesystem, the function falls back to S3 download
 | `OUTPUT_PREFIX` | Path prefix for transcription files | (same path as source) |
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
 
+## Batch Processing (Schedule Trigger)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SCHEDULE_BUCKET` | S3 bucket to scan on Schedule trigger | (empty -- required for batch mode) |
+| `SCHEDULE_PREFIX` | S3 prefix path under SCHEDULE_BUCKET | `pending/` |
+
+When a Schedule trigger fires (cron/timer), the function lists all objects under `s3://SCHEDULE_BUCKET/SCHEDULE_PREFIX` and transcribes any files with supported extensions. Files are processed sequentially within a single pod; with horizontal scaling (multiple pods), multiple batches can run in parallel.
+
 ### Output Location Behavior
 
 The output location is controlled by `OUTPUT_BUCKET` and `OUTPUT_PREFIX`:
@@ -124,6 +133,10 @@ envs:
   OUTPUT_BUCKET: ""
   OUTPUT_PREFIX: ""
 
+  # --- Schedule Trigger (batch processing) ---
+  SCHEDULE_BUCKET: ""
+  SCHEDULE_PREFIX: "pending/"
+
   # --- Logging ---
   LOG_LEVEL: "INFO"
 ```
@@ -171,6 +184,10 @@ envs:
   OUTPUT_BUCKET: "transcriptions"
   OUTPUT_PREFIX: "2026-04"       # Organize by date
 
+  # --- Schedule Trigger (batch processing via cron) ---
+  SCHEDULE_BUCKET: "media-ingest"
+  SCHEDULE_PREFIX: "pending/"    # Files here get transcribed on schedule
+
   # --- Logging ---
   LOG_LEVEL: "WARNING"           # Reduce log volume in production
 ```
@@ -180,13 +197,18 @@ Key decisions:
 - `base` model: 7x realtime on CPU with good accuracy (8% WER)
 - `int8` compute: Fastest CPU inference
 - Separate `OUTPUT_BUCKET`: Organizes transcriptions away from media files
+- `SCHEDULE_BUCKET`/`SCHEDULE_PREFIX`: Enables cron-based batch processing
 - `LOG_LEVEL: WARNING`: Reduces log storage and improves performance
 
-See [Deployment Guide](DEPLOYMENT.md) for mount path configuration on your cluster.
+See [Deployment Guide](DEPLOYMENT.md) for mount path configuration and trigger setup on your cluster.
 
 ## Trigger Configuration
 
-The element trigger watches for new media files:
+The function supports three trigger types in DataEngine:
+
+### Element Trigger (Single File Upload)
+
+Watches for new media file uploads to S3. Create per file type:
 
 | Setting | Value |
 |---------|-------|
@@ -195,6 +217,38 @@ The element trigger watches for new media files:
 | **Source Type** | S3 |
 | **Source Bucket** | Your media S3 bucket |
 | **Suffix Filter** | `.mp4` (or multiple triggers for each format) |
+
+### Schedule Trigger (Batch Processing)
+
+Runs on a cron schedule to batch-process files. Set `SCHEDULE_BUCKET` and `SCHEDULE_PREFIX`:
+
+| Setting | Value |
+|---------|-------|
+| **Trigger Type** | Schedule |
+| **Event Type** | Schedule.TimerElapsed |
+| **Cron Expression** | e.g., `0 */6 * * *` (every 6 hours) |
+| **Function Parameter** | `SCHEDULE_BUCKET` (e.g., `media-ingest`) |
+| **Function Parameter** | `SCHEDULE_PREFIX` (e.g., `pending/`) |
+
+When triggered, the function lists `s3://SCHEDULE_BUCKET/SCHEDULE_PREFIX` and processes all files with supported extensions.
+
+### Function Trigger (Direct Invocation)
+
+Another function calls this one with explicit file details:
+
+| Setting | Value |
+|---------|-------|
+| **Trigger Type** | Function |
+| **Function Target** | media-transcription |
+| **Data Payload** | JSON with `bucket` and `key` fields |
+
+Example calling this function from another DataEngine function:
+```python
+invoke_result = invoke_function(
+    "media-transcription",
+    {"bucket": "media-assets", "key": "uploads/interview.mp4"}
+)
+```
 
 ## Credentials Security
 

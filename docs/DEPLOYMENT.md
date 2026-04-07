@@ -96,21 +96,51 @@ vast functions get media-transcription -r    # With revisions
 vast functions get media-transcription -o json | jq '{name, status}'
 ```
 
-## Step 5: Create the Element Trigger
+## Step 5: Create Triggers
 
-Configure a trigger to watch for media file uploads. You can create multiple triggers for different file types:
+The function supports three trigger types. Configure one or more as needed:
 
-```bash
-# Example: watch for MP4 uploads
-vast functions update media-transcription \
-  --custom-extension autoscaling.knative.dev/minScale=0 \
-  --custom-extension autoscaling.knative.dev/maxScale=10
-```
+### Element Trigger (Single File Upload)
 
 In the VMS UI:
 1. Navigate to **Manage Elements** -> **Triggers** -> **Create Element Trigger**
-2. Set source bucket, event type `ObjectCreated`, suffix filter (e.g., `.mp4`)
+2. Set source bucket to your media bucket
+3. Event type: `ObjectCreated` (or `ObjectCreated:*`)
+4. Suffix filter: `.mp4` (repeat for each format or use wildcard)
+5. Link to the `media-transcription` function
+6. Deploy trigger
+
+For multiple formats, create separate triggers (one per file type) or use suffix filter `.*` for all files (requires the function to validate extensions).
+
+### Schedule Trigger (Batch Processing)
+
+In the VMS UI:
+1. Navigate to **Manage Elements** -> **Triggers** -> **Create Schedule Trigger**
+2. Set cron expression (e.g., `0 */6 * * *` for every 6 hours)
 3. Link to the `media-transcription` function
+4. In function config, set:
+   - `SCHEDULE_BUCKET`: S3 bucket to scan
+   - `SCHEDULE_PREFIX`: Path prefix (e.g., `pending/`)
+5. Deploy trigger
+
+When the cron fires, the function lists `s3://SCHEDULE_BUCKET/SCHEDULE_PREFIX`, finds all files with supported extensions, and transcribes them sequentially within the pod.
+
+### Function Trigger (Function-to-Function)
+
+In your orchestrator function, invoke `media-transcription` with explicit file details:
+
+```python
+# Example: from another DataEngine function
+result = invoke_function(
+    "media-transcription",
+    {
+        "bucket": "media-assets",
+        "key": "uploads/interview.mp4"
+    }
+)
+```
+
+No separate VMS configuration needed. The calling function passes the bucket/key in the CloudEvent data payload.
 
 ## Step 5b: Set Up NFS/SMB Mount (Optional, for Mount Path Access)
 
@@ -150,6 +180,8 @@ vast functions update media-transcription \
 
 ## Step 8: Test End-to-End
 
+### Test Element Trigger
+
 Upload a media file to the watched bucket:
 
 ```bash
@@ -163,6 +195,34 @@ Check for the transcription output:
 aws s3 ls s3://YOUR_BUCKET/uploads/sample.transcription.json \
   --endpoint-url http://YOUR_DATA_VIP
 ```
+
+### Test Schedule Trigger Locally
+
+Use the provided test event:
+
+```bash
+# Terminal 1: Run the function locally
+vast functions localrun media-transcription -c config.yaml -v
+
+# Terminal 2: Send a Schedule test event
+vast functions invoke -e cloudevent-schedule.yaml -u http://localhost:8080
+```
+
+You should see the function list objects under `SCHEDULE_BUCKET/SCHEDULE_PREFIX` and transcribe each one.
+
+### Test Function Trigger Locally
+
+Use the provided test event:
+
+```bash
+# Terminal 1: Run the function locally
+vast functions localrun media-transcription -c config.yaml -v
+
+# Terminal 2: Send a Function test event
+vast functions invoke -e cloudevent-function.yaml -u http://localhost:8080
+```
+
+You should see the function transcribe the file specified in the event data.
 
 ## Updating the Function
 

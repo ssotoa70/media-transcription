@@ -13,16 +13,35 @@ media-transcription is a VAST DataEngine function that automatically transcribes
 
 ## How It Works
 
+The function supports three trigger types for flexible integration:
+
 ```
-Media file uploaded to S3 bucket
-  --> VAST DataEngine ElementCreated trigger (suffix filter)
-    --> media-transcription function container
-      --> Resolve media path (mount or S3 download)
-      --> Extracts audio from video (ffmpeg, 16kHz mono WAV)
-      --> Transcribes with faster-whisper (VAD + beam search)
-      --> Writes .transcription.json sidecar to S3
-      --> Returns structured result with language, segments, timestamps
+TRIGGER 1: Element (S3 file upload)
+  File uploaded to S3 bucket
+    --> VAST DataEngine Element.ObjectCreated trigger
+      --> media-transcription function
+        --> Transcribe + upload result
+
+TRIGGER 2: Schedule (Cron/timer batch)
+  Cron/timer fires
+    --> VAST DataEngine Schedule.TimerElapsed trigger
+      --> media-transcription function lists S3 prefix
+        --> Batch-transcribe all media files with pagination
+        --> Upload results for each file
+
+TRIGGER 3: Function (Direct invocation)
+  Another function calls media-transcription
+    --> VAST DataEngine Function trigger
+      --> media-transcription function processes explicit file
+        --> Transcribe + upload result
 ```
+
+**Core Processing** (same for all trigger types):
+- Resolve media path (mount for direct access or S3 download)
+- Extract audio from video (ffmpeg, 16kHz mono WAV)
+- Transcribe with faster-whisper (VAD + beam search)
+- Write .transcription.json sidecar to S3
+- Return structured result with language, segments, timestamps
 
 **Idempotency:** Before processing, the function checks if a `.transcription.json` file already exists for the input. If it does, the event is skipped. Safe for event redelivery.
 
@@ -52,16 +71,18 @@ See [Architecture](docs/ARCHITECTURE.md) for the full data flow diagram and [Con
 ## Project Structure
 
 ```
-main.py              # DataEngine handler (init + handler + ASR abstraction)
-config.yaml          # Environment variables for deployment
-requirements.txt     # Python dependencies (boto3, faster-whisper)
-Aptfile              # System packages (ffmpeg, libsndfile1, libopenblas-dev)
-customDeps           # Custom Python modules (currently unused)
-cloudevent.yaml      # Test CloudEvent for local development
+main.py                    # DataEngine handler (init + trigger handlers + ASR abstraction)
+config.yaml                # Environment variables for deployment
+requirements.txt           # Python dependencies (boto3, faster-whisper)
+Aptfile                    # System packages (ffmpeg, libsndfile1, libopenblas-dev)
+customDeps                 # Custom Python modules (currently unused)
+cloudevent.yaml            # Test CloudEvent for Element trigger
+cloudevent-schedule.yaml   # Test CloudEvent for Schedule trigger (batch)
+cloudevent-function.yaml   # Test CloudEvent for Function trigger (direct)
 docs/
-  ARCHITECTURE.md    # Handler flow, event model, ASR design
+  ARCHITECTURE.md    # Handler flow, trigger types, event model, ASR design
   CONFIGURATION.md   # Environment variables reference
-  DEPLOYMENT.md      # Build, deploy, and configure guide
+  DEPLOYMENT.md      # Build, deploy, configure trigger types
   PERFORMANCE.md     # Model selection, tuning, scaling
   TROUBLESHOOTING.md # Common issues and solutions
 ```
@@ -106,9 +127,11 @@ Video files are automatically converted to 16kHz mono WAV via ffmpeg before tran
 | `MEDIA_MOUNT_PATH` | NFS/SMB mount for direct file access | (empty, use S3) |
 | `OUTPUT_BUCKET` | Destination bucket for transcriptions | (same as source) |
 | `OUTPUT_PREFIX` | Path prefix for output files | (same path as source) |
+| `SCHEDULE_BUCKET` | Bucket to scan on Schedule trigger | (empty) |
+| `SCHEDULE_PREFIX` | S3 prefix for pending files (Schedule trigger) | `pending/` |
 | `ASR_MODEL_SIZE` | Whisper model: tiny/base/small/medium/large-v3 | `base` |
 | `ASR_DEVICE` | Compute device: cpu/cuda | `cpu` |
-| `MAX_FILE_SIZE_MB` | Maximum file size to process | `2048` |
+| `MAX_FILE_SIZE_MB` | Maximum file size to process (S3 mode) | `2048` |
 
 See [Configuration Reference](docs/CONFIGURATION.md) for complete details on all environment variables.
 
