@@ -48,8 +48,20 @@ These credentials are used to download media files and upload transcription resu
 |----------|-------------|---------|
 | `MAX_FILE_SIZE_MB` | Maximum input file size | `2048` |
 | `SUPPORTED_EXTENSIONS` | Comma-separated extensions | `.mp4,.mkv,.webm,.mov,.avi,.mxf,.ts,.wav,.mp3,.flac,.ogg,.m4a,.aac,.wma` |
-| `OUTPUT_MODE` | Output strategy | `s3_sidecar` |
+| `OUTPUT_BUCKET` | Destination bucket for transcriptions | (same as source) |
+| `OUTPUT_PREFIX` | Path prefix for transcription files | (same path as source) |
 | `LOG_LEVEL` | Logging verbosity | `INFO` |
+
+### Output Location Behavior
+
+The output location is controlled by `OUTPUT_BUCKET` and `OUTPUT_PREFIX`:
+
+| `OUTPUT_BUCKET` | `OUTPUT_PREFIX` | Input | Output |
+|-----------------|-----------------|-------|--------|
+| (empty) | (empty) | `s3://media/uploads/video.mp4` | `s3://media/uploads/video.transcription.json` |
+| `transcripts` | (empty) | `s3://media/uploads/video.mp4` | `s3://transcripts/uploads/video.transcription.json` |
+| (empty) | `results/2026` | `s3://media/uploads/video.mp4` | `s3://media/results/2026/video.transcription.json` |
+| `transcripts` | `results/2026` | `s3://media/uploads/video.mp4` | `s3://transcripts/results/2026/video.transcription.json` |
 
 ## config.yaml Format
 

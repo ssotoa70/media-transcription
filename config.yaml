@@ -27,8 +27,11 @@ envs:
   SUPPORTED_EXTENSIONS: ".mp4,.mkv,.webm,.mov,.avi,.mxf,.ts,.wav,.mp3,.flac,.ogg,.m4a,.aac,.wma"
 
   # Output Configuration
-  # Write transcription JSON alongside original file in S3
-  OUTPUT_MODE: "s3_sidecar"
+  # Override output bucket (default: same as source bucket)
+  OUTPUT_BUCKET: ""
+  # Override output prefix/path (default: same path as source file)
+  # Example: "transcriptions/2026" -> s3://OUTPUT_BUCKET/transcriptions/2026/file.transcription.json
+  OUTPUT_PREFIX: ""
 
   # Logging
   LOG_LEVEL: "INFO"

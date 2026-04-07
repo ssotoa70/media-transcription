@@ -28,6 +28,8 @@ s3_client = None
 asr_engine = None
 supported_extensions: set[str] = set()
 max_file_size_bytes: int = 0
+output_bucket: Optional[str] = None
+output_prefix: Optional[str] = None
 
 
 # ===========================================================================
@@ -189,7 +191,7 @@ def extract_audio(input_path: str, output_path: str, ctx) -> None:
 
 def init(ctx):
     """One-time initialization when the function container starts."""
-    global s3_client, asr_engine, supported_extensions, max_file_size_bytes
+    global s3_client, asr_engine, supported_extensions, max_file_size_bytes, output_bucket, output_prefix
 
     ctx.logger.info("=" * 80)
     ctx.logger.info("INITIALIZING MEDIA-TRANSCRIPTION FUNCTION")
@@ -226,8 +228,16 @@ def init(ctx):
     max_mb = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))
     max_file_size_bytes = max_mb * 1024 * 1024
 
+    # --- Output location ---
+    output_bucket = os.environ.get("OUTPUT_BUCKET", "") or None
+    output_prefix = os.environ.get("OUTPUT_PREFIX", "") or None
+
     ctx.logger.info(f"Supported extensions: {sorted(supported_extensions)}")
     ctx.logger.info(f"Max file size: {max_mb} MB")
+    if output_bucket:
+        ctx.logger.info(f"Output bucket: {output_bucket}")
+    if output_prefix:
+        ctx.logger.info(f"Output prefix: {output_prefix}")
     ctx.logger.info("=" * 80)
     ctx.logger.info("MEDIA-TRANSCRIPTION FUNCTION READY")
     ctx.logger.info("=" * 80)
@@ -260,11 +270,13 @@ def handler(ctx, event):
 
         ctx.logger.info(f"Processing: s3://{s3_bucket}/{s3_key}")
 
+        # --- Resolve output location ---
+        dest_bucket, output_key = _get_output_location(s3_bucket, s3_key)
+
         # --- Idempotency: skip if transcription already exists ---
-        output_key = str(Path(s3_key).with_suffix(".transcription.json"))
-        if _s3_object_exists(ctx, s3_bucket, output_key):
-            ctx.logger.info(f"Transcription already exists: s3://{s3_bucket}/{output_key} - skipping")
-            return {"status": "skipped", "message": "Transcription already exists", "output_location": f"s3://{s3_bucket}/{output_key}"}
+        if _s3_object_exists(ctx, dest_bucket, output_key):
+            ctx.logger.info(f"Transcription already exists: s3://{dest_bucket}/{output_key} - skipping")
+            return {"status": "skipped", "message": "Transcription already exists", "output_location": f"s3://{dest_bucket}/{output_key}"}
 
         # --- Download media file ---
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -297,9 +309,9 @@ def handler(ctx, event):
         }
 
         # --- Upload result to S3 ---
-        _upload_to_s3(ctx, s3_bucket, output_key, json.dumps(output, indent=2, ensure_ascii=False))
+        _upload_to_s3(ctx, dest_bucket, output_key, json.dumps(output, indent=2, ensure_ascii=False))
 
-        ctx.logger.info(f"Result uploaded: s3://{s3_bucket}/{output_key}")
+        ctx.logger.info(f"Result uploaded: s3://{dest_bucket}/{output_key}")
         ctx.logger.info(
             f"Summary: {result.language} | {len(result.segments)} segments | "
             f"{len(result.text)} chars | {result.duration:.1f}s"
@@ -307,7 +319,7 @@ def handler(ctx, event):
 
         return {
             "status": "success",
-            "output_location": f"s3://{s3_bucket}/{output_key}",
+            "output_location": f"s3://{dest_bucket}/{output_key}",
             "language": result.language,
             "duration_seconds": round(result.duration, 2),
             "segment_count": len(result.segments),
@@ -322,6 +334,26 @@ def handler(ctx, event):
 # ===========================================================================
 # Helpers
 # ===========================================================================
+
+def _get_output_location(source_bucket: str, source_key: str) -> tuple[str, str]:
+    """Compute output bucket and key based on OUTPUT_BUCKET / OUTPUT_PREFIX env vars.
+
+    Behavior:
+      - No env vars set:        same bucket, sidecar key (video.mp4 -> video.transcription.json)
+      - OUTPUT_BUCKET only:     different bucket, same key structure
+      - OUTPUT_PREFIX only:     same bucket, key under prefix (prefix/video.transcription.json)
+      - Both set:               different bucket, key under prefix
+    """
+    dest_bucket = output_bucket or source_bucket
+    filename = Path(source_key).with_suffix(".transcription.json").name
+
+    if output_prefix:
+        dest_key = f"{output_prefix.strip('/')}/{filename}"
+    else:
+        dest_key = str(Path(source_key).with_suffix(".transcription.json"))
+
+    return dest_bucket, dest_key
+
 
 def _get_file_location(ctx, event) -> tuple[Optional[str], Optional[str]]:
     """Extract S3 bucket and key from a VAST CloudEvent."""
